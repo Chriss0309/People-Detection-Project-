@@ -23,33 +23,27 @@ class ProcessThread(QThread):
     def run(self):
         while True:
             if rb.is_full:
-                counts, _ = processVideoFeed(rb.pop())  # Assuming processVideoFeed returns count and annotated frame
+                counts = processVideoFeed(rb.pop())
                 if counts:
-                    if len(counts) > 0 and counts[0] != 0:
+                    if counts[0] != 0:
                         self.changePixmapSignal.emit(counts[0], True)
-                    if len(counts) > 1 and counts[1] != 0:
+                    if counts[1] != 0:
                         self.changePixmapSignal.emit(counts[1], False)
-
 
 class VideoThread(QThread):
     changePixmapSignal = Signal(np.ndarray)
 
     def __init__(self):
         super().__init__()
-        self.stopped = False
 
     def run(self):
         cap = cv2.VideoCapture(0)
-        while cap.isOpened() and not self.stopped:
+        while cap.isOpened():
             ret, frame = cap.read()
+            rb.append(frame)
             if ret:
                 self.changePixmapSignal.emit(frame)
         cap.release()
-
-    def stop(self):
-        self.stopped = True
-        self.wait()
-
 
 class MyWidget(QWidget):
     peopleEntered = 0
@@ -133,7 +127,6 @@ class MyWidget(QWidget):
         self.thread.stop()
         event.accept()
 
-
     def updateCount(self, count, enter):
         if enter:
             self.peopleEntered += count
@@ -144,16 +137,8 @@ class MyWidget(QWidget):
 
     @Slot(np.ndarray)
     def updateImage(self, frame):
-        # Convert frame to Qt format
         qtImg = self.cvToQt(frame)
-        
-        # Update GUI with the annotated frame
         self.feed.setPixmap(qtImg)
-
-        # Ensure GUI remains responsive by limiting updates
-        QApplication.processEvents()
-
-
 
     def cvToQt(self, frame):
         rgbImg = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -174,16 +159,16 @@ def analyzeFace(frame, x1, y1, x2, y2):
                 age = analysis.get('age', None)
                 gender = analysis.get('gender', None)
                 print(f"Age: {age}, Gender: {gender}")
-                return face, age, gender  # Return face image along with age and gender
+                return age, gender
             else:
                 print("Analysis result is not valid")
-                return None, None, None
+                return None, None
         else:
             print("Face area is invalid (size 0)")
-            return None, None, None
+            return None, None
     except Exception as e:
         print(f"Error analyzing face: {e}")
-        return None, None, None
+        return None, None
 
 def deleteLostCentroids(oldCentroids):
     i = 0
@@ -298,8 +283,7 @@ def processVideoFeed(frame):
         x2 = int(coords[0, 2])
         y2 = int(coords[0, 3])
 
-        # Get face image and analysis results
-        face, age, gender = analyzeFace(frame, x1, y1, x2, y2)
+        age, gender = analyzeFace(frame, x1, y1, x2, y2)
 
         walkingDirection = ''
 
@@ -309,12 +293,6 @@ def processVideoFeed(frame):
             walkingDirection = 'Left'
 
         newCentroids.append({'x': (x1+x2)/2, 'y': (y1+y2)/2, 'matched': False, 'walkingDirection': walkingDirection})
-
-        # Display age and gender predictions on GUI
-        if age is not None and gender is not None:
-            # Assuming you have a QLabel widget for displaying predictions
-            prediction_text = f"Age: {age}, Gender: {gender}"
-            cv2.putText(frame, prediction_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (36,255,12), 2)
 
         i += 1
 
@@ -326,7 +304,7 @@ def processVideoFeed(frame):
         manageLostCentroids(oldCentroids)
         deleteLostCentroids(oldCentroids)
 
-    return count, frame  # Return count and annotated frame
+    return count
 
 if __name__=="__main__":
     rb = RingBuffer(capacity=1, dtype=np.ndarray, allow_overwrite=True)
