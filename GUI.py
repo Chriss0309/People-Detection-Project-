@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 from PySide6 import QtGui
 from PySide6.QtWidgets import QWidget, QApplication, QLabel, QVBoxLayout, QGridLayout
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPixmap, QImage, QPainter, QPen
 from PySide6.QtCore import Signal, Slot, Qt, QThread
 import sys
 import math
@@ -137,8 +137,9 @@ class MyWidget(QWidget):
 
     @Slot(np.ndarray)
     def updateImage(self, frame):
-        qtImg = self.cvToQt(frame)
+        qtImg, faces = self.cvToQt(frame)
         self.feed.setPixmap(qtImg)
+        self.drawBoundingBoxes(faces)
 
     def cvToQt(self, frame):
         rgbImg = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -146,7 +147,30 @@ class MyWidget(QWidget):
         bytes = ch * w
         qtFormat = QtGui.QImage(rgbImg.data, w, h, bytes, QtGui.QImage.Format_RGB888)
         p = qtFormat.scaled(self.width, self.height, Qt.KeepAspectRatio)
-        return QPixmap.fromImage(p)
+        return QPixmap.fromImage(p), rgbImg
+
+    def drawBoundingBoxes(self, faces):
+        pixmap = self.feed.pixmap()
+        painter = QPainter(pixmap)
+        painter.setPen(QPen(Qt.red, 2))
+
+        try:
+            for face in faces:
+                if isinstance(face, (tuple, list)) and len(face) >= 4:
+                    x1, y1, x2, y2 = map(int, face[:4])
+                    painter.drawRect(x1, y1, x2 - x1, y2 - y1)
+                else:
+                    print(f"Ignore invalid bounding box format: {face}")
+
+        except Exception as e:
+            print(f"Error drawing bounding boxes: {e}")
+
+        painter.end()
+        self.feed.setPixmap(pixmap)
+
+
+
+
 
 def analyzeFace(frame, x1, y1, x2, y2):
     face = frame[y1:y2, x1:x2]
@@ -274,6 +298,8 @@ def processVideoFeed(frame):
     if oldCentroids: 
         setAllCentroidsToUnmatched(oldCentroids)
     
+    faces = []
+
     i = 0
     for box in results[0].boxes:
         boxNumpy = box.numpy()
@@ -284,6 +310,8 @@ def processVideoFeed(frame):
         y2 = int(coords[0, 3])
 
         age, gender = analyzeFace(frame, x1, y1, x2, y2)
+
+        faces.append((x1, y1, x2, y2))
 
         walkingDirection = ''
 
@@ -304,7 +332,7 @@ def processVideoFeed(frame):
         manageLostCentroids(oldCentroids)
         deleteLostCentroids(oldCentroids)
 
-    return count
+    return count, faces
 
 if __name__=="__main__":
     rb = RingBuffer(capacity=1, dtype=np.ndarray, allow_overwrite=True)
