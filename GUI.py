@@ -1,11 +1,13 @@
 import cv2
 import numpy as np
 from PySide6 import QtGui
-from PySide6.QtWidgets import QWidget, QApplication, QLabel, QVBoxLayout, QGridLayout
+from PySide6.QtWidgets import QWidget, QApplication, QLabel, QGridLayout
 from PySide6.QtGui import QPixmap
 from PySide6.QtCore import Signal, Slot, Qt, QThread
 import sys
 import math
+import time
+import threading
 from dvg_ringbuffer import RingBuffer
 from ultralytics import YOLO
 from deepface import DeepFace
@@ -13,43 +15,52 @@ from deepface import DeepFace
 model = YOLO('yolov8n-pose.pt')
 oldCentroids = []
 LINE = 320
+latest_analysis = {}
+rb = RingBuffer(capacity=1, dtype=np.ndarray, allow_overwrite=True)
+
+def analyze_faces_periodically():
+    global latest_analysis
+    while True:
+        if rb.is_full:
+            frame = rb.pop()
+            results = model.predict(frame, classes=0, conf=0.7, verbose=False, imgsz=(416, 256))
+            for i, box in enumerate(results[0].boxes):
+                boxNumpy = box.numpy()
+                coords = boxNumpy.xyxy
+                x1, y1, x2, y2 = map(int, coords[0])
+                face = frame[y1:y2, x1:x2]
+                try:
+                    analysis = DeepFace.analyze(face, actions=['age', 'gender'], enforce_detection=False)
+                    if analysis and isinstance(analysis, list) and len(analysis) > 0:
+                        analysis = analysis[0]
+                        age = analysis.get('age', None)
+                        gender = analysis.get('dominant_gender', None)
+                        latest_analysis[i] = (age, gender)
+                except Exception as e:
+                    print(f"Error analyzing face: {e}")
+        time.sleep(1)  # Analyze every 1 second
 
 class ProcessThread(QThread):
     changePixmapSignal = Signal(int, bool)
+    processedFrameSignal = Signal(np.ndarray)
 
     def __init__(self):
         super().__init__()
-
-    def run(self):
-        while True:
-            if rb.is_full:
-                counts, _ = processVideoFeed(rb.pop())  # Assuming processVideoFeed returns count and annotated frame
-                if counts:
-                    if len(counts) > 0 and counts[0] != 0:
-                        self.changePixmapSignal.emit(counts[0], True)
-                    if len(counts) > 1 and counts[1] != 0:
-                        self.changePixmapSignal.emit(counts[1], False)
-
-
-class VideoThread(QThread):
-    changePixmapSignal = Signal(np.ndarray)
-
-    def __init__(self):
-        super().__init__()
-        self.stopped = False
 
     def run(self):
         cap = cv2.VideoCapture(0)
-        while cap.isOpened() and not self.stopped:
+        while cap.isOpened():
             ret, frame = cap.read()
             if ret:
-                self.changePixmapSignal.emit(frame)
+                rb.append(frame)
+                processed_frame, counts = processVideoFeed(frame)
+                self.processedFrameSignal.emit(processed_frame)
+                if counts:
+                    if counts[0] != 0:
+                        self.changePixmapSignal.emit(counts[0], True)
+                    if counts[1] != 0:
+                        self.changePixmapSignal.emit(counts[1], False)
         cap.release()
-
-    def stop(self):
-        self.stopped = True
-        self.wait()
-
 
 class MyWidget(QWidget):
     peopleEntered = 0
@@ -57,7 +68,7 @@ class MyWidget(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Qt live label demo")
+        self.setWindowTitle("People Counter")
         self.width = 640
         self.height = 480
 
@@ -67,49 +78,27 @@ class MyWidget(QWidget):
         self.logo.setFixedWidth(130)
         self.logo.setFixedHeight(85)
         self.logo.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter)
-        self.logo.setStyleSheet(
-            "background-color: black;"
-        )
+        self.logo.setStyleSheet("background-color: black;")
 
         self.entered = QLabel("Entered")
         self.entered.setFixedHeight(100)
         self.entered.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter)
-        self.entered.setStyleSheet(
-            "font-family: 'Times New Roman', Times, serif;"
-            "color: white;"
-            "background-color: black;"
-        )
+        self.entered.setStyleSheet("font-family: 'Times New Roman', Times, serif; color: white; background-color: black;")
 
         self.enteredCount = QLabel(self)
         self.enteredCount.setText("0")
         self.enteredCount.setFixedHeight(50)
         self.enteredCount.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
-        self.enteredCount.setStyleSheet(
-            "font-family: 'Times New Roman', Times, serif;"
-            "color: white;"
-            "font-size: 30px;"
-            "background-color: black;"
-            "padding-top: 1px;"
-        )
+        self.enteredCount.setStyleSheet("font-family: 'Times New Roman', Times, serif; color: white; font-size: 30px; background-color: black; padding-top: 1px;")
 
         self.left = QLabel("Left")
         self.left.setFixedHeight(50)
         self.left.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter)
-        self.left.setStyleSheet(
-            "font-family: 'Times New Roman', Times, serif;"
-            "color: white;"
-            "background-color: black;"
-        )
+        self.left.setStyleSheet("font-family: 'Times New Roman', Times, serif; color: white; background-color: black;")
 
         self.leftCount = QLabel("0")
         self.leftCount.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
-        self.leftCount.setStyleSheet(
-            "font-size: 30px;"
-            "background-color: black;"
-            "color: white;"
-            "font-family: 'Times New Roman', Times, serif;"
-            "padding-top: 1px;"
-        )
+        self.leftCount.setStyleSheet("font-size: 30px; background-color: black; color: white; font-family: 'Times New Roman', Times, serif; padding-top: 1px;")
 
         self.feed = QLabel(self)
 
@@ -122,17 +111,14 @@ class MyWidget(QWidget):
         gridLayout.addWidget(self.leftCount, 4, 0)
         gridLayout.addWidget(self.feed, 0, 1, 5, 1)
 
-        self.thread = VideoThread()
         self.pThread = ProcessThread()
-        self.thread.changePixmapSignal.connect(self.updateImage)
         self.pThread.changePixmapSignal.connect(self.updateCount)
-        self.thread.start()
+        self.pThread.processedFrameSignal.connect(self.updateProcessedImage)
         self.pThread.start()
 
     def closeEvent(self, event):
-        self.thread.stop()
+        self.pThread.stop()
         event.accept()
-
 
     def updateCount(self, count, enter):
         if enter:
@@ -143,17 +129,9 @@ class MyWidget(QWidget):
             self.leftCount.setText(str(self.peopleLeft))
 
     @Slot(np.ndarray)
-    def updateImage(self, frame):
-        # Convert frame to Qt format
+    def updateProcessedImage(self, frame):
         qtImg = self.cvToQt(frame)
-        
-        # Update GUI with the annotated frame
         self.feed.setPixmap(qtImg)
-
-        # Ensure GUI remains responsive by limiting updates
-        QApplication.processEvents()
-
-
 
     def cvToQt(self, frame):
         rgbImg = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -162,28 +140,6 @@ class MyWidget(QWidget):
         qtFormat = QtGui.QImage(rgbImg.data, w, h, bytes, QtGui.QImage.Format_RGB888)
         p = qtFormat.scaled(self.width, self.height, Qt.KeepAspectRatio)
         return QPixmap.fromImage(p)
-
-def analyzeFace(frame, x1, y1, x2, y2):
-    face = frame[y1:y2, x1:x2]
-
-    try:
-        if face.size > 0:
-            analysis = DeepFace.analyze(face, actions=['age', 'gender'], enforce_detection=False)
-            if analysis and isinstance(analysis, list) and len(analysis) > 0:
-                analysis = analysis[0]
-                age = analysis.get('age', None)
-                gender = analysis.get('gender', None)
-                print(f"Age: {age}, Gender: {gender}")
-                return face, age, gender  # Return face image along with age and gender
-            else:
-                print("Analysis result is not valid")
-                return None, None, None
-        else:
-            print("Face area is invalid (size 0)")
-            return None, None, None
-    except Exception as e:
-        print(f"Error analyzing face: {e}")
-        return None, None, None
 
 def deleteLostCentroids(oldCentroids):
     i = 0
@@ -263,7 +219,6 @@ def matchCentroids(oldCentroids, newCentroids):
             if oldCentroids[i]['matched']:
                 oldCentroids[i]['enter'] = True
                 count[1] += 1
-
     return count
 
 def registerNewCentroids(oldCentroids, newCentroids):
@@ -280,7 +235,7 @@ def calculateDistance(a, b):
 
 def processVideoFeed(frame):
     global oldCentroids
-    global model 
+    global latest_analysis
 
     newCentroids = []
 
@@ -289,34 +244,23 @@ def processVideoFeed(frame):
     if oldCentroids: 
         setAllCentroidsToUnmatched(oldCentroids)
     
-    i = 0
-    for box in results[0].boxes:
+    for i, box in enumerate(results[0].boxes):
         boxNumpy = box.numpy()
         coords = boxNumpy.xyxy
-        x1 = int(coords[0, 0])
-        y1 = int(coords[0, 1])
-        x2 = int(coords[0, 2])
-        y2 = int(coords[0, 3])
+        x1, y1, x2, y2 = map(int, coords[0])
 
-        # Get face image and analysis results
-        face, age, gender = analyzeFace(frame, x1, y1, x2, y2)
+        # Draw bounding box around the face
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-        walkingDirection = ''
+        # Use the latest analysis results
+        if i in latest_analysis:
+            age, gender = latest_analysis[i]
+            label = f"Age: {age}, Gender: {gender}"
+            cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (36,255,12), 2)
 
-        if results[0].keypoints.numpy().xy[i, 3][0] == 0:
-            walkingDirection = 'Right' 
-        if results[0].keypoints.numpy().xy[i, 4][0] == 0:
-            walkingDirection = 'Left'
+        walkingDirection = 'Right' if results[0].keypoints.numpy().xy[i, 3][0] == 0 else 'Left'
 
         newCentroids.append({'x': (x1+x2)/2, 'y': (y1+y2)/2, 'matched': False, 'walkingDirection': walkingDirection})
-
-        # Display age and gender predictions on GUI
-        if age is not None and gender is not None:
-            # Assuming you have a QLabel widget for displaying predictions
-            prediction_text = f"Age: {age}, Gender: {gender}"
-            cv2.putText(frame, prediction_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (36,255,12), 2)
-
-        i += 1
 
     count = []
 
@@ -326,10 +270,10 @@ def processVideoFeed(frame):
         manageLostCentroids(oldCentroids)
         deleteLostCentroids(oldCentroids)
 
-    return count, frame  # Return count and annotated frame
+    return frame, count
 
 if __name__=="__main__":
-    rb = RingBuffer(capacity=1, dtype=np.ndarray, allow_overwrite=True)
+    threading.Thread(target=analyze_faces_periodically, daemon=True).start()
     app = QApplication(sys.argv)
     a = MyWidget()
     a.show()
