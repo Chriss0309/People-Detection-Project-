@@ -3,12 +3,13 @@ from PySide6.QtWidgets import QWidget, QApplication, QLabel, QVBoxLayout, QGridL
 from PySide6.QtGui import QPixmap, QImage
 import sys
 import cv2
-from PySide6.QtCore import Signal, Slot, Qt, QThread, QTimer
+from PySide6.QtCore import Signal, Slot, Qt, QThread, QTimer, QMutex, QWaitCondition
 import numpy as np
 import math
 from dvg_ringbuffer import RingBuffer
 from ultralytics import YOLO
 import time
+import queue
 
 # Load pre-trained models
 faceProto = "opencv_face_detector.pbtxt"
@@ -33,7 +34,11 @@ LINE = 320
 
 last_detection_time = 0
 last_count_time = 0
+frame_skip = 3 # Process every nth frame
 
+frame_queue = queue.Queue(maxsize=5)  # Limit the number of frames in the queue
+mutex = QMutex()
+condition = QWaitCondition()
 
 def highlightFace(net, frame, conf_threshold=0.7):
     frameOpencvDnn = frame.copy()
@@ -219,14 +224,21 @@ class ProcessThread(QThread):
     def run(self):
         global last_count_time
         while True: 
-            if rb.is_full and time.time() - last_count_time > 1: 
-                counts = processVideoFeed(rb.pop())
+            mutex.lock()
+            if frame_queue.empty():
+                condition.wait(mutex)
+            frame = frame_queue.get()
+            mutex.unlock()
+            
+            if time.time() - last_count_time > 1: 
+                counts = processVideoFeed(frame)
                 last_count_time = time.time()
                 if counts: 
                     if counts[0] != 0: 
                         self.changePixmapSignal.emit(counts[0], True)
                     if counts[1] != 0: 
                         self.changePixmapSignal.emit(counts[1], False)
+
 
 class VideoThread(QThread):
     changePixmapSignal = Signal(np.ndarray)
@@ -238,22 +250,41 @@ class VideoThread(QThread):
     def run(self):
         global last_detection_time
         cap = cv2.VideoCapture(0)
+        cap.set(cv2.CAP_PROP_FPS, 15)  # Limit the frame rate to 15 FPS
+        frame_count = 0
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-            resultImg, faceBoxes = highlightFace(faceNet, frame)
-            if time.time() - last_detection_time > 2:
-                self.updateFaceBoxesSignal.emit(faceBoxes)
-                last_detection_time = time.time()
 
-            for faceBox in faceBoxes:
-                face = frame[max(0, faceBox[1]):min(faceBox[3], frame.shape[0] - 1), max(0, faceBox[0]):min(faceBox[2], frame.shape[1] - 1)]
-                age, gender = detect_age_gender(face)
-                cv2.putText(resultImg, f'{gender}, {age}', (faceBox[0], faceBox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+            if frame_count % frame_skip == 0:
+                # Resize frame for faster processing
+                frame = cv2.resize(frame, (640, 480))
+                resultImg, faceBoxes = highlightFace(faceNet, frame)
+                if time.time() - last_detection_time > 2:
+                    self.updateFaceBoxesSignal.emit(faceBoxes)
+                    last_detection_time = time.time()
 
-            rb.append(frame)
-            self.changePixmapSignal.emit(resultImg)
+                for faceBox in faceBoxes:
+                    face = frame[max(0, faceBox[1]):min(faceBox[3], frame.shape[0] - 1), max(0, faceBox[0]):min(faceBox[2], frame.shape[1] - 1)]
+                    age, gender = detect_age_gender(face)
+                    cv2.putText(resultImg, f'{gender}, {age}', (faceBox[0], faceBox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+
+                if not frame_queue.full():
+                    frame_queue.put(frame)
+                    mutex.lock()
+                    condition.wakeAll()
+                    mutex.unlock()
+                    
+                self.changePixmapSignal.emit(resultImg)
+            else:
+                if not frame_queue.full():
+                    frame_queue.put(frame)
+                    mutex.lock()
+                    condition.wakeAll()
+                    mutex.unlock()
+
+            frame_count += 1
 
         cap.release()
         
